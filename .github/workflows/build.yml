@@ -25,7 +25,7 @@ jobs:
           pyinstaller --onefile --windowed --name "PSV17_Auto_Tool" psv17_batch_renamer.py
 
       - name: Upload EXE
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: PSV17_Auto_Tool_EXE
           path: dist/PSV17_Auto_Tool.exe
