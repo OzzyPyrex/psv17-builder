@@ -1,0 +1,24 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+build/
+dist/
+*.spec
+*.exe
+
+output/
+manual_review/
+logs/
+
+# Never commit scanned identity/licensing documents.
+*.pdf
+*.jpg
+*.jpeg
+*.png
+*.tif
+*.tiff
+
+.DS_Store
+Thumbs.db
