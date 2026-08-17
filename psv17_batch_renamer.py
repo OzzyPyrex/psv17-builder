@@ -12,6 +12,7 @@
 #         Maintenance and updates are managed by the author.
 # =============================================================================
 
+import os
 import re
 import sys
 import shutil
@@ -26,12 +27,11 @@ from pdf2image import convert_from_path
 # =========================================================================
 # 1. CONFIGURATION & SETUP
 # =========================================================================
-# Adjust these paths if the office computer has them installed elsewhere.
-# HARDCODED OFFICE PATHS
-TESSERACT_EXE = r"C:\Users\Adithya_Muralidharan\AppData\Local\Programs\Tesseract-OCR\tesseract.exe"
-POPPLER_BIN = r"C:\poppler\Library\bin"
+# Configure external tools with environment variables when auto-detection is
+# not sufficient. This keeps workstation-specific paths out of source control.
+TESSERACT_EXE = os.getenv("TESSERACT_EXE") or shutil.which("tesseract")
+POPPLER_BIN = os.getenv("POPPLER_BIN") or None
 
-# Point pytesseract to the executable
 if TESSERACT_EXE:
     pytesseract.pytesseract.tesseract_cmd = TESSERACT_EXE
 
