@@ -2,17 +2,18 @@ __pycache__/
 *.py[cod]
 .venv/
 venv/
+.pytest_cache/
 
+# Generated application artifacts and platform builds
 build/
 dist/
 *.spec
 *.exe
 
+# Restricted batch material: never commit scans or OCR outputs.
 output/
 manual_review/
 logs/
-
-# Never commit scanned identity/licensing documents.
 *.pdf
 *.jpg
 *.jpeg

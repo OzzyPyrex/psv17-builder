@@ -1,349 +1,387 @@
-# =============================================================================
-# PSV17 BATCH AUTOMATION SUITE
-# =============================================================================
-# AUTHOR:      Adithya
-# COPYRIGHT:   © 2026 Adithya. All Rights Reserved.
-# DATE:        2026-01-25
-# VERSION:     v10.0 (Pilot Build)
-# DESCRIPTION: Computer Vision automation for NTA Driver Licensing (PSV17).
-#              Extracts Badge IDs via OCR and pairs files by scan timestamp.
-# =============================================================================
-# NOTICE: This tool is a prototype developed to improve operational efficiency.
-#         Maintenance and updates are managed by the author.
-# =============================================================================
+"""Privacy-first OCR-assisted batch organiser.
 
+This utility plans PDF/photo moves from an OCR-extracted reference identifier.
+It is deliberately non-destructive by default: the command only creates or
+moves files when the caller supplies ``--apply``.
+"""
+
+from __future__ import annotations
+
+import argparse
+import hashlib
 import os
 import re
-import sys
 import shutil
+import sys
+from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
-from datetime import datetime
-import cv2
-import numpy as np
-import pytesseract
-from PIL import Image
-from pdf2image import convert_from_path
-
-# =========================================================================
-# 1. CONFIGURATION & SETUP
-# =========================================================================
-# Configure external tools with environment variables when auto-detection is
-# not sufficient. This keeps workstation-specific paths out of source control.
-TESSERACT_EXE = os.getenv("TESSERACT_EXE") or shutil.which("tesseract")
-POPPLER_BIN = os.getenv("POPPLER_BIN") or None
-
-if TESSERACT_EXE:
-    pytesseract.pytesseract.tesseract_cmd = TESSERACT_EXE
-
-# Supported photo extensions for the sibling files
-PHOTO_EXTS = (".jpg", ".jpeg", ".png")
-
-# Folder names for the output
-OUT_DIR_NAME = "output"
-MANUAL_DIR_NAME = "manual_review"
-LOG_DIR_NAME = "logs"
+from typing import Callable, Sequence
 
 
-def now_stamp() -> str:
-    """Returns a clean timestamp string for filenames."""
-    return datetime.now().strftime("%Y%m%d_%H%M%S")
+PHOTO_EXTENSIONS = {".jpg", ".jpeg", ".png"}
+OUTPUT_DIRECTORY = "output"
+MANUAL_REVIEW_DIRECTORY = "manual_review"
+LOG_DIRECTORY = "logs"
+
+# One letter followed by three or four digits is the limited identifier shape
+# used by this legacy workflow. Keeping it strict prevents arbitrary OCR text
+# from becoming part of a filename.
+IDENTIFIER_PATTERN = re.compile(r"\b([A-Z])\s?([0-9O]{3,4})\b", re.IGNORECASE)
 
 
-def ensure_dirs(base: Path) -> tuple[Path, Path, Path]:
-    """Creates the necessary output folders if they don't exist."""
-    out_dir = base / OUT_DIR_NAME
-    manual_dir = base / MANUAL_DIR_NAME
-    log_dir = base / LOG_DIR_NAME
-    out_dir.mkdir(exist_ok=True)
-    manual_dir.mkdir(exist_ok=True)
-    log_dir.mkdir(exist_ok=True)
-    return out_dir, manual_dir, log_dir
+@dataclass(frozen=True)
+class PlannedAction:
+    """A validated move that has not necessarily been applied yet."""
+
+    kind: str
+    source: Path
+    destination: Path
+    record_identifier: str | None
 
 
-def write_log(log_file: Path, msg: str) -> None:
-    """Appends a message to the daily log file."""
-    with open(log_file, "a", encoding="utf-8") as f:
-        f.write(msg + "\n")
+@dataclass(frozen=True)
+class BatchSummary:
+    """Non-sensitive batch outcome counts."""
+
+    scanned_files: int
+    automatic_actions: int
+    manual_review_actions: int
+    applied: bool
+    actions: tuple[PlannedAction, ...]
 
 
-# =========================================================================
-# 2. INTELLIGENT NAME EXTRACTION
-# =========================================================================
-def extract_name_from_page(pil_img: Image.Image) -> str:
+def normalise_identifier(value: str | None) -> str | None:
+    """Return a strict, OCR-normalised identifier or ``None``.
+
+    The normalised identifier is intentionally the only OCR result allowed in
+    output filenames. Candidate names are not extracted or used.
     """
-    Attempts to find the driver's name on a receipt page.
-    Includes a 'Strict Filter' to reject garbage text or headers.
-    """
+
+    if not value:
+        return None
+    match = IDENTIFIER_PATTERN.fullmatch(value.strip().upper())
+    if not match:
+        return None
+    return f"{match.group(1)}{match.group(2).replace('O', '0')}"
+
+
+def extract_identifier_from_text(text: str) -> str | None:
+    """Find the first strict identifier in OCR text, correcting O/0 noise."""
+
+    for match in IDENTIFIER_PATTERN.finditer(text.upper()):
+        identifier = normalise_identifier(match.group(0))
+        if identifier:
+            return identifier
+    return None
+
+
+def _ocr_dependencies():
+    """Load optional OCR dependencies only when a real document is processed."""
+
     try:
-        # 1. ROI Selection: Crop top 40% (Names are rarely at the bottom)
-        w, h = pil_img.size
-        crop = pil_img.crop((0, 0, w, int(h * 0.4)))
+        import cv2
+        import numpy as np
+        import pytesseract
+        from pdf2image import convert_from_path
+    except ImportError as error:  # pragma: no cover - exercised by real users
+        raise RuntimeError(
+            "OCR dependencies are unavailable. Install requirements.txt before processing documents."
+        ) from error
 
-        # 2. OCR Scan: PSM 6 is optimized for single blocks of text
-        text = pytesseract.image_to_string(crop, config='--psm 6')
-        lines = text.split('\n')
-
-        # 3. Blocklist: Common words on the receipt that are NOT names
-        BLOCKLIST = [
-            "RECEIPT", "PAYMENT", "LICENSING", "AUTHORITY", "NATIONAL",
-            "TRANSPORT", "DUBLIN", "NAISIUNTA", "IOMPAIR", "UDARAS",
-            "OFFICE", "LICENCE", "SPSV", "DRIVER", "AMOUNT", "TOTAL",
-            "DATE", "TIME", "STREET", "AVENUE", "ROAD"
-        ]
-
-        for line in lines:
-            # Cleanup: Uppercase, remove special chars
-            clean = re.sub(r"[^A-Z\s]", "", line.upper()).strip()
-
-            # --- SAFETY CHECKS ---
-            if len(clean) < 5: continue  # Too short to be a full name
-            if any(char.isdigit() for char in line): continue  # Names don't have numbers
-
-            # If the line contains ANY of the blocklist words, skip it.
-            if any(blocked in clean for blocked in BLOCKLIST):
-                continue
-
-            # Two-Word Minimum Check (First Name + Last Name)
-            words = clean.split()
-            if len(words) < 2:
-                continue
-
-            # Sanity Check for Gibberish (e.g. "A B C")
-            if sum(len(w) for w in words) < 5:
-                continue
-
-            # If we survived all checks, return the formatted name
-            return clean.replace(" ", "_")[:30]
-
-    except Exception:
-        pass
-    return ""
+    tesseract_executable = os.getenv("TESSERACT_EXE") or shutil.which("tesseract")
+    if tesseract_executable:
+        pytesseract.pytesseract.tesseract_cmd = tesseract_executable
+    return cv2, np, pytesseract, convert_from_path
 
 
-# =========================================================================
-# 3. BADGE EXTRACTION (THE SNIPER)
-# =========================================================================
-def extract_badge_with_context(pil_img: Image.Image, page_num: int) -> tuple[str | None, int, bool]:
-    """
-    Scans the page for the Badge Number (e.g., M0635).
-    Also detects if the page is a 'Receipt' to trigger name extraction.
-    Returns: (Badge, Confidence, Is_Receipt_Page)
-    """
-    is_receipt = False
-    try:
-        # Convert to Grayscale for better OCR
-        gray = np.array(pil_img.convert("L"))
-        h, w = gray.shape[:2]
+def extract_identifier_from_page(page) -> str | None:
+    """Use conservative OCR regions to find an identifier on one PDF page."""
 
-        # --- CHECK 1: Is this a Receipt Page? ---
-        # We do a quick low-res scan for keywords
-        full_page_thumb = cv2.resize(gray, (w // 2, h // 2))
-        thumb_text = pytesseract.image_to_string(full_page_thumb).upper()
-        if "RECEIPT" in thumb_text and "PAYMENT" in thumb_text:
-            is_receipt = True
-
-        # --- CHECK 2: The Sniper Scope (Badge Hunt) ---
-        # We look in two specific places: Top Right (Table) and Center (Receipt Body)
-        crops = [
-            ("Top-Right Table", int(h * 0.15), int(h * 0.35), int(w * 0.75), w),
-            ("Center Receipt", int(h * 0.20), int(h * 0.60), int(w * 0.10), int(w * 0.90))
-        ]
-
-        for (scope_name, y1, y2, x1, x2) in crops:
-            crop = gray[y1:y2, x1:x2]
-            if crop.size == 0: continue
-
-            # Image Pre-processing: Zoom x3 + Thresholding (B&W)
-            sh, sw = crop.shape[:2]
-            zoomed = cv2.resize(crop, (sw * 3, sh * 3), interpolation=cv2.INTER_CUBIC)
-            bw = cv2.threshold(zoomed, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
-
-            # Run OCR on the zoomed crop
-            text = pytesseract.image_to_string(bw, config='--psm 6')
-            text_upper = text.upper().strip()
-
-            # Context Verification: Does it look like a license area?
-            has_context = any(k in text_upper for k in ["LICENCE", "NUMBER", "DRIVER", "BADGE", "SPSV"])
-
-            # --- THE REGEX FIX ---
-            # Finds [Letter] followed by [3 or 4 Digits]
-            # {3,4} ensures we catch M123 AND M0635
-            candidates = re.findall(r"\b([A-Z])\s?([0-9O]{3,4})\b", text_upper)
-
-            for (let, nums) in candidates:
-                # If we are in the Table (strong location) or have text context (strong keywords)...
-                if has_context or scope_name == "Top-Right Table":
-                    # Fix common OCR error: Letter 'O' -> Digit '0'
-                    nums_fixed = nums.replace('O', '0')
-                    badge = f"{let}{nums_fixed}"
-                    print(f"   [JACKPOT] Found Badge {badge} via {scope_name} on Page {page_num}")
-                    return badge, 99, is_receipt
-
-    except Exception:
-        pass
-    return None, -1, is_receipt
-
-
-# =========================================================================
-# 4. DOCUMENT PROCESSOR
-# =========================================================================
-def extract_data_from_pdf(pdf_path: Path):
-    """
-    Opens a PDF and loops through every page to find the Badge and Name.
-    """
-    # Convert PDF pages to Images
-    pages = convert_from_path(str(pdf_path), poppler_path=POPPLER_BIN)
-
-    found_badge = None
-    found_name = ""
-
-    # Loop through pages
-    for idx, page in enumerate(pages):
-        badge, conf, is_receipt = extract_badge_with_context(page, idx + 1)
-
-        # Grab Badge if we haven't found one yet
-        if badge and not found_badge:
-            found_badge = badge
-
-        # Grab Name if we haven't found one yet AND this is a receipt page
-        if is_receipt and not found_name:
-            found_name = extract_name_from_page(page)
-            if found_name:
-                print(f"   [NAME] Found Name '{found_name}' on Page {idx + 1}")
-
-    return found_badge, found_name
-
-
-def process_batch(folder_path: Path) -> None:
-    """
-    The Main Coordinator.
-    1. Sorts files by TIME (to pair PDFs with Photos correctly).
-    2. Runs extraction on PDFs.
-    3. Renames and moves files based on results.
-    """
-    out_dir, manual_dir, log_dir = ensure_dirs(folder_path)
-    log_file = log_dir / f"run_{now_stamp()}.log"
-
-    # SORT BY TIME: Critical for scanners that name files sequentially
-    files = sorted([p for p in folder_path.iterdir() if p.is_file()], key=lambda p: p.stat().st_mtime)
-
-    # Counters for the Final Report
-    total_files = len(files)
-    success_count = 0
-    manual_count = 0
-
-    print("\n" + "=" * 60)
-    print(" PSV17 AUTOMATION TOOL - v10.0 (Pilot)")
-    print(" Developed by: Adithya")
-    print(" For Internal DL Operations Efficiency")
-    print("=" * 60 + "\n")
-
-    start_msg = f"Batch Run: {folder_path.name} | Found {total_files} files (Sorted by Time)."
-    print(start_msg)
-    write_log(log_file, start_msg)
-
-    processed_indices = set()
-
-    # Loop through all files
-    for i in range(len(files)):
-        if i in processed_indices: continue
-
-        file_a = files[i]
-
-        # We only process PDFs as the "Leader" of a pair
-        if file_a.suffix.lower() == ".pdf":
-            print(f"Processing: {file_a.name}...")
-
-            # Check the NEXT file in the list. Is it a photo?
-            file_b = None
-            if i + 1 < len(files):
-                potential_b = files[i + 1]
-                if potential_b.suffix.lower() in PHOTO_EXTS:
-                    file_b = potential_b
-
-            # --- EXTRACT DATA ---
-            badge, name, _ = (None, "", None)
-            try:
-                badge, name = extract_data_from_pdf(file_a)
-            except Exception as e:
-                print(f"   [Error] {e}")
-                write_log(log_file, f"ERROR processing {file_a.name}: {e}")
-
-            # --- DECISION TIME ---
-            if badge:
-                # [SUCCESS PATH]
-                success_count += 1
-                base_name = f"{badge}_{name}" if name else f"{badge}"
-                new_pdf_name = f"{base_name}_PSV17.pdf"
-                new_photo_name = f"{base_name}_PHOTO{file_b.suffix.lower()}" if file_b else None
-
-                # Handle Duplicate Filenames (Increment counter)
-                target_pdf = out_dir / new_pdf_name
-                counter = 1
-                while target_pdf.exists():
-                    target_pdf = out_dir / f"{base_name}_{counter}_PSV17.pdf"
-                    if new_photo_name:
-                        new_photo_name = f"{base_name}_{counter}_PHOTO{file_b.suffix.lower()}"
-                    counter += 1
-
-                # MOVE PDF
-                shutil.move(str(file_a), str(target_pdf))
-                print(f"   ✅ PDF Renamed: {new_pdf_name}")
-                log_msg = f"SUCCESS: {file_a.name} -> {new_pdf_name}"
-
-                # MOVE PHOTO (If it exists)
-                if file_b:
-                    target_photo = out_dir / new_photo_name
-                    shutil.move(str(file_b), str(target_photo))
-                    print(f"   ✅ Photo Renamed: {new_photo_name}")
-                    log_msg += f" | Photo: {file_b.name} -> {new_photo_name}"
-                    processed_indices.add(i + 1)  # Mark photo as done
-                else:
-                    print(f"   ⚠️ No sibling photo found.")
-                    log_msg += " | No Photo Found"
-
-                write_log(log_file, log_msg)
-                processed_indices.add(i)  # Mark PDF as done
-
-            else:
-                # [FAILURE PATH] -> MANUAL REVIEW
-                manual_count += 1
-                print(f"   ❌ FAILED: Badge not found. Moving to Manual.")
-                shutil.move(str(file_a), str(manual_dir / file_a.name))
-                msg = f"MANUAL: {file_a.name} (Badge not found)"
-
-                if file_b:
-                    shutil.move(str(file_b), str(manual_dir / file_b.name))
-                    msg += f" | Photo: {file_b.name} moved"
-                    processed_indices.add(i + 1)
-
-                write_log(log_file, msg)
-                processed_indices.add(i)
-
-    # --- FINAL REPORT ---
-    summary = (
-        f"\n{'=' * 30}\n"
-        f"BATCH COMPLETE REPORT\n"
-        f"{'=' * 30}\n"
-        f"Total Scanned: {total_files}\n"
-        f"✅ Auto-Renamed: {success_count}\n"
-        f"⚠️ Manual Review: {manual_count}\n"
-        f"{'=' * 30}"
+    cv2, np, pytesseract, _ = _ocr_dependencies()
+    gray = np.array(page.convert("L"))
+    height, width = gray.shape[:2]
+    regions = (
+        (int(height * 0.12), int(height * 0.38), int(width * 0.68), width),
+        (int(height * 0.20), int(height * 0.60), int(width * 0.10), int(width * 0.90)),
     )
-    print(summary)
-    write_log(log_file, summary)
+
+    for y_start, y_end, x_start, x_end in regions:
+        crop = gray[y_start:y_end, x_start:x_end]
+        if crop.size == 0:
+            continue
+        crop_height, crop_width = crop.shape[:2]
+        enlarged = cv2.resize(
+            crop,
+            (crop_width * 3, crop_height * 3),
+            interpolation=cv2.INTER_CUBIC,
+        )
+        thresholded = cv2.threshold(
+            enlarged, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU
+        )[1]
+        identifier = extract_identifier_from_text(
+            pytesseract.image_to_string(thresholded, config="--psm 6")
+        )
+        if identifier:
+            return identifier
+    return None
 
 
-# =========================================================================
-# 5. EXECUTION ENTRY POINT
-# =========================================================================
+def extract_identifier_from_pdf(pdf_path: Path) -> str | None:
+    """Extract a conservative identifier without retaining page images or text."""
+
+    _, _, _, convert_from_path = _ocr_dependencies()
+    poppler_path = os.getenv("POPPLER_BIN") or None
+    pages = convert_from_path(str(pdf_path), poppler_path=poppler_path)
+    for page in pages:
+        identifier = extract_identifier_from_page(page)
+        if identifier:
+            return identifier
+    return None
+
+
+def _path_token(path: Path) -> str:
+    """Create a stable non-reversible-looking reference for audit logs."""
+
+    digest = hashlib.sha256(str(path).encode("utf-8")).hexdigest()
+    return digest[:12]
+
+
+def redact_log_message(message: str) -> str:
+    """Remove common personal-data forms before any audit entry is written.
+
+    Callers should not pass personal data to logs in the first place. This is a
+    defence-in-depth layer for filenames, e-mail addresses, identifier strings,
+    and accidental Windows paths included by lower-level exceptions.
+    """
+
+    redacted = re.sub(r"[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}", "<email>", message)
+    # Treat a complete log segment containing a document name (and an optional
+    # source-to-destination arrow) as sensitive. This also covers filenames
+    # containing spaces, which a simple ``\S+`` pattern would miss.
+    redacted = re.sub(
+        r"(?i)(?:^|(?<=[;|]))[^;|\r\n]*?\.(?:pdf|jpe?g|png|tiff?)(?:\s*->\s*[^;|\r\n]*?\.(?:pdf|jpe?g|png|tiff?))?",
+        "<file>",
+        redacted,
+    )
+    redacted = re.sub(
+        r"(?i)(?:[A-Z]:)?(?:[^\\/:*?\"<>|\r\n]+\\)+[^\\/:*?\"<>|\r\n]+",
+        "<path>",
+        redacted,
+    )
+    redacted = IDENTIFIER_PATTERN.sub("<identifier>", redacted)
+    return redacted
+
+
+def write_log(log_file: Path, message: str) -> None:
+    """Append a redacted audit entry; never persist source filenames or OCR text."""
+
+    timestamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    with log_file.open("a", encoding="utf-8") as stream:
+        stream.write(f"{timestamp} {redact_log_message(message)}\n")
+
+
+def _assert_within_batch(batch_directory: Path, path: Path) -> None:
+    """Prevent an unexpected path from escaping the selected batch directory."""
+
+    batch_root = batch_directory.resolve()
+    try:
+        path.resolve(strict=False).relative_to(batch_root)
+    except ValueError as error:
+        raise ValueError("Refusing to operate outside the selected batch directory.") from error
+
+
+def _unique_destination(candidate: Path, reserved: set[Path]) -> Path:
+    """Return an unused destination without overwriting an existing file."""
+
+    suffix = candidate.suffix
+    stem = candidate.stem
+    counter = 1
+    destination = candidate
+    while destination.exists() or destination.resolve(strict=False) in reserved:
+        destination = candidate.with_name(f"{stem}_{counter}{suffix}")
+        counter += 1
+    reserved.add(destination.resolve(strict=False))
+    return destination
+
+
+def _source_files(batch_directory: Path) -> list[Path]:
+    """List direct batch files in timestamp order, without traversing subfolders."""
+
+    def scan_role(path: Path) -> int:
+        # A scanner can assign identical timestamps. In that case, deliberately
+        # place the document before its following photo rather than depending on
+        # filesystem enumeration order.
+        if path.suffix.lower() == ".pdf":
+            return 0
+        if path.suffix.lower() in PHOTO_EXTENSIONS:
+            return 1
+        return 2
+
+    return sorted(
+        (path for path in batch_directory.iterdir() if path.is_file()),
+        key=lambda path: (path.stat().st_mtime, scan_role(path), path.name.casefold()),
+    )
+
+
+def build_batch_plan(
+    batch_directory: Path,
+    extractor: Callable[[Path], str | None] = extract_identifier_from_pdf,
+) -> tuple[list[PlannedAction], int]:
+    """Create a non-mutating plan for direct PDF/photo scan pairs."""
+
+    batch_directory = batch_directory.expanduser().resolve()
+    if not batch_directory.is_dir():
+        raise NotADirectoryError("The selected batch location is not a folder.")
+
+    files = _source_files(batch_directory)
+    output_directory = batch_directory / OUTPUT_DIRECTORY
+    manual_directory = batch_directory / MANUAL_REVIEW_DIRECTORY
+    reserved: set[Path] = set()
+    processed: set[int] = set()
+    actions: list[PlannedAction] = []
+
+    for index, source_pdf in enumerate(files):
+        if index in processed or source_pdf.suffix.lower() != ".pdf":
+            continue
+
+        source_photo: Path | None = None
+        if index + 1 < len(files) and files[index + 1].suffix.lower() in PHOTO_EXTENSIONS:
+            source_photo = files[index + 1]
+
+        identifier = normalise_identifier(extractor(source_pdf))
+        if identifier:
+            document_destination = _unique_destination(
+                output_directory / f"{identifier}_document.pdf", reserved
+            )
+            actions.append(
+                PlannedAction("rename_document", source_pdf, document_destination, identifier)
+            )
+            if source_photo:
+                photo_destination = _unique_destination(
+                    output_directory / f"{identifier}_photo{source_photo.suffix.lower()}",
+                    reserved,
+                )
+                actions.append(
+                    PlannedAction("rename_photo", source_photo, photo_destination, identifier)
+                )
+                processed.add(index + 1)
+        else:
+            document_destination = _unique_destination(manual_directory / source_pdf.name, reserved)
+            actions.append(
+                PlannedAction("manual_review_document", source_pdf, document_destination, None)
+            )
+            if source_photo:
+                photo_destination = _unique_destination(manual_directory / source_photo.name, reserved)
+                actions.append(
+                    PlannedAction("manual_review_photo", source_photo, photo_destination, None)
+                )
+                processed.add(index + 1)
+        processed.add(index)
+
+    return actions, len(files)
+
+
+def _apply_actions(batch_directory: Path, actions: Sequence[PlannedAction], log_file: Path) -> None:
+    """Perform previously planned moves after explicit caller approval."""
+
+    for action in actions:
+        _assert_within_batch(batch_directory, action.source)
+        _assert_within_batch(batch_directory, action.destination)
+        if not action.source.is_file():
+            raise FileNotFoundError("A planned source document is no longer available.")
+        if action.destination.exists():
+            raise FileExistsError("A planned destination now exists; re-run the preview first.")
+
+        action.destination.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            shutil.move(str(action.source), str(action.destination))
+        except OSError as error:
+            # Do not persist exception text: it can contain a full filename/path.
+            write_log(
+                log_file,
+                f"event=move_failed kind={action.kind} source={_path_token(action.source)} reason={type(error).__name__}",
+            )
+            raise
+        write_log(
+            log_file,
+            f"event=move_applied kind={action.kind} source={_path_token(action.source)} destination={_path_token(action.destination)}",
+        )
+
+
+def process_batch(
+    batch_directory: Path,
+    *,
+    apply: bool = False,
+    extractor: Callable[[Path], str | None] = extract_identifier_from_pdf,
+) -> BatchSummary:
+    """Preview a batch by default; mutate it only when ``apply=True``.
+
+    In preview mode this function does not create output, manual-review, or log
+    folders. OCR still reads PDFs to make the proposed plan, so use only on
+    documents the caller is authorised to process.
+    """
+
+    batch_directory = batch_directory.expanduser().resolve()
+    actions, scanned_files = build_batch_plan(batch_directory, extractor)
+    automatic_actions = sum(action.kind.startswith("rename_") for action in actions)
+    manual_actions = len(actions) - automatic_actions
+
+    if apply:
+        log_directory = batch_directory / LOG_DIRECTORY
+        log_directory.mkdir(exist_ok=True)
+        log_file = log_directory / f"run_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%S')}.log"
+        write_log(
+            log_file,
+            f"event=batch_started scanned_files={scanned_files} planned_actions={len(actions)}",
+        )
+        _apply_actions(batch_directory, actions, log_file)
+        write_log(
+            log_file,
+            f"event=batch_completed automatic_actions={automatic_actions} manual_review_actions={manual_actions}",
+        )
+
+    return BatchSummary(
+        scanned_files=scanned_files,
+        automatic_actions=automatic_actions,
+        manual_review_actions=manual_actions,
+        applied=apply,
+        actions=tuple(actions),
+    )
+
+
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Preview a privacy-first OCR batch plan; use --apply to move files."
+    )
+    parser.add_argument("batch_directory", type=Path, help="Folder containing one scan batch")
+    parser.add_argument(
+        "--apply",
+        action="store_true",
+        help="Explicitly apply the reviewed move plan. Omit this for a safe preview.",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    args = parse_args(argv)
+    try:
+        summary = process_batch(args.batch_directory, apply=args.apply)
+    except Exception as error:
+        # Exception messages can include document names, so only reveal their class.
+        print(f"Processing stopped safely ({type(error).__name__}).", file=sys.stderr)
+        return 2
+
+    mode = "Applied" if summary.applied else "Preview"
+    print(
+        f"{mode}: scanned {summary.scanned_files} file(s); "
+        f"automatic actions {summary.automatic_actions}; "
+        f"manual-review actions {summary.manual_review_actions}."
+    )
+    if not summary.applied:
+        print("No files or folders were changed. Review the batch, then re-run with --apply.")
+    return 0
+
+
 if __name__ == "__main__":
-    # 1. Grab folder from command line (Drag & Drop support)
-    target_folder = Path(sys.argv[1]) if len(sys.argv) > 1 else Path.cwd()
-
-    # 2. Run the processor
-    process_batch(target_folder)
-
-    # 3. KEEP WINDOW OPEN so user can see the report
-    print("\nProcessing finished.")
-    input("Press Enter to close this window...")
+    raise SystemExit(main())
